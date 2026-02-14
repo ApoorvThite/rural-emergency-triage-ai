@@ -1,4 +1,3 @@
-cat > README.md << 'EOF'
 # 🏥 Rural Emergency Triage AI Assistant
 
 **AI-powered critical decision support for rural emergency departments when specialists aren't available**

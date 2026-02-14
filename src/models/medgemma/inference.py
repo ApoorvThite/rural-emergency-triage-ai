@@ -1,127 +1,217 @@
 """
-MedGemma inference script
+MedGemma inference script using conversational format.
+
+Loads a fine-tuned MedGemma model (LoRA adapter) and runs inference
+using the same conversational prompt format as training.
 """
 
 import torch
-import torch.nn as nn
-from typing import Dict, List, Union
+import json
+from typing import Dict, List, Union, Optional
 import numpy as np
 from PIL import Image
-import yaml
 from pathlib import Path
-
-from .train import MedGemmaClassifier
+from transformers import AutoProcessor, AutoModelForImageTextToText
+from peft import PeftModel
 
 
 class MedGemmaInference:
-    """Inference wrapper for MedGemma classifier"""
+    """Inference wrapper for fine-tuned MedGemma model."""
     
     def __init__(
         self,
-        model_path: str,
-        config_path: str,
-        device: str = 'cuda',
+        lora_adapter_path: str,
+        base_model_id: Optional[str] = None,
     ):
         """
         Args:
-            model_path: Path to trained model checkpoint
-            config_path: Path to training config
-            device: Device to run inference on
+            lora_adapter_path: Path to fine-tuned LoRA adapter directory
+            base_model_id: Base MedGemma model ID (auto-detected from task_config.json if not provided)
         """
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        adapter_path = Path(lora_adapter_path)
         
-        # Load config
-        with open(config_path, 'r') as f:
-            self.config = yaml.safe_load(f)
+        # Load task config
+        config_file = adapter_path / 'task_config.json'
+        if not config_file.exists():
+            raise FileNotFoundError(
+                f"task_config.json not found in {lora_adapter_path}. "
+                "Make sure you're pointing to a directory with a trained model."
+            )
         
-        # Initialize model
-        num_classes = len(self.config['task']['classes'])
-        self.model = MedGemmaClassifier(
-            model_name=self.config['model']['name'],
-            num_classes=num_classes,
-            load_in_4bit=self.config['model']['load_in_4bit'],
-            device_map=self.config['model']['device_map'],
+        with open(config_file, 'r') as f:
+            self.task_config = json.load(f)
+        
+        # Get model ID
+        if base_model_id is None:
+            base_model_id = self.task_config['model_id']
+        
+        self.class_labels = self.task_config['class_labels']
+        self.prompt = self.task_config['prompt']
+        self.task_name = self.task_config['task']
+        
+        print(f"Loading MedGemma model: {base_model_id}")
+        print(f"Task: {self.task_name}")
+        print(f"Classes: {len(self.class_labels)}")
+        
+        # Determine dtype
+        if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+            self.compute_dtype = torch.bfloat16
+        else:
+            self.compute_dtype = torch.float16
+        
+        # Load base model
+        self.model = AutoModelForImageTextToText.from_pretrained(
+            base_model_id,
+            torch_dtype=self.compute_dtype,
+            device_map='auto',
         )
         
-        # Load weights
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+        # Load LoRA adapter
+        print(f"Loading LoRA adapter from: {lora_adapter_path}")
+        self.model = PeftModel.from_pretrained(self.model, str(adapter_path))
         self.model.eval()
         
-        self.class_names = self.config['task']['classes']
-        self.threshold = self.config['task']['threshold']
+        # Load processor
+        self.processor = AutoProcessor.from_pretrained(str(adapter_path))
+        
+        print("✓ Model loaded successfully!")
     
     @torch.no_grad()
     def predict(
         self,
         image: Union[str, np.ndarray, Image.Image],
-        return_probabilities: bool = True,
+        max_new_tokens: int = 100,
     ) -> Dict:
         """
-        Make prediction on single image
+        Make prediction on single image using conversational format.
         
         Args:
             image: Image path, numpy array, or PIL Image
-            return_probabilities: Whether to return class probabilities
+            max_new_tokens: Maximum tokens to generate
         
         Returns:
-            Dictionary with predictions
+            Dictionary with prediction, raw response, and parsed class
         """
-        # Load and preprocess image
+        # Load image
         if isinstance(image, str):
-            image = Image.open(image).convert('RGB')
+            if image.endswith('.dcm'):
+                import pydicom
+                dcm = pydicom.dcmread(image)
+                arr = dcm.pixel_array.astype(np.float32)
+                arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
+                pil_image = Image.fromarray(arr.astype(np.uint8)).convert('RGB')
+            else:
+                pil_image = Image.open(image).convert('RGB')
         elif isinstance(image, np.ndarray):
-            image = Image.fromarray(image)
+            pil_image = Image.fromarray(image).convert('RGB')
+        else:
+            pil_image = image.convert('RGB')
         
-        # TODO: Apply proper preprocessing (resize, normalize, etc.)
-        # This should match the preprocessing used during training
+        # Build conversational input
+        messages = [
+            {
+                'role': 'user',
+                'content': [
+                    {'type': 'image'},
+                    {'type': 'text', 'text': self.prompt},
+                ],
+            },
+        ]
         
-        # Convert to tensor and add batch dimension
-        # image_tensor = preprocess(image).unsqueeze(0).to(self.device)
+        # Format with chat template
+        text_input = self.processor.apply_chat_template(
+            messages, add_generation_prompt=True, tokenize=False
+        )
         
-        # Forward pass
-        # logits = self.model(image_tensor)
-        # probabilities = torch.softmax(logits, dim=1)[0]
+        # Process inputs
+        inputs = self.processor(
+            text=text_input,
+            images=[pil_image],
+            return_tensors='pt',
+        ).to(self.model.device, dtype=self.compute_dtype)
         
-        # For now, return dummy prediction
-        # TODO: Replace with actual inference
-        probabilities = torch.rand(len(self.class_names))
-        probabilities = probabilities / probabilities.sum()
+        input_len = inputs['input_ids'].shape[-1]
         
-        predicted_class_idx = probabilities.argmax().item()
-        predicted_class = self.class_names[predicted_class_idx]
-        confidence = probabilities[predicted_class_idx].item()
+        # Generate response
+        with torch.inference_mode():
+            output = self.model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+            )
         
-        result = {
+        # Decode response
+        response = self.processor.decode(
+            output[0][input_len:], skip_special_tokens=True
+        ).strip()
+        
+        # Parse predicted class
+        predicted_class_idx = -1
+        predicted_class = None
+        
+        for idx, class_label in enumerate(self.class_labels):
+            # Check if the letter prefix is in the response (e.g., "A:", "B:")
+            letter = class_label.split(':')[0].strip()
+            if letter in response:
+                predicted_class_idx = idx
+                predicted_class = class_label
+                break
+        
+        # Fallback: default to first class if parsing fails
+        if predicted_class_idx == -1:
+            predicted_class_idx = 0
+            predicted_class = self.class_labels[0]
+        
+        return {
             'predicted_class': predicted_class,
             'predicted_class_idx': predicted_class_idx,
-            'confidence': confidence,
+            'raw_response': response,
+            'task': self.task_name,
         }
-        
-        if return_probabilities:
-            result['probabilities'] = {
-                class_name: prob.item()
-                for class_name, prob in zip(self.class_names, probabilities)
-            }
-        
-        return result
     
     @torch.no_grad()
     def predict_batch(
         self,
         images: List[Union[str, np.ndarray, Image.Image]],
+        max_new_tokens: int = 100,
     ) -> List[Dict]:
-        """Make predictions on batch of images"""
+        """Make predictions on batch of images.
         
-        return [self.predict(img) for img in images]
+        Note: Currently processes images sequentially.
+        For true batch processing, you'd need to modify the conversational
+        format handling to support batches.
+        """
+        return [self.predict(img, max_new_tokens=max_new_tokens) for img in images]
 
 
 if __name__ == '__main__':
-    # Example usage
-    inference = MedGemmaInference(
-        model_path='./data/models/hemorrhage_detection/best_model.pt',
-        config_path='./configs/hemorrhage_detection.yaml',
-    )
+    import argparse
     
-    result = inference.predict('./data/raw/sample_ct.dcm')
-    print(result)
+    parser = argparse.ArgumentParser(description='Run MedGemma inference')
+    parser.add_argument(
+        '--adapter',
+        type=str,
+        required=True,
+        help='Path to LoRA adapter directory',
+    )
+    parser.add_argument(
+        '--image',
+        type=str,
+        required=True,
+        help='Path to image file (DICOM, PNG, JPG)',
+    )
+    args = parser.parse_args()
+    
+    # Load model
+    inference = MedGemmaInference(lora_adapter_path=args.adapter)
+    
+    # Run prediction
+    result = inference.predict(args.image)
+    
+    print("\n" + "="*60)
+    print("MedGemma Prediction")
+    print("="*60)
+    print(f"Task: {result['task']}")
+    print(f"Predicted: {result['predicted_class']}")
+    print(f"Raw response: {result['raw_response']}")
+    print("="*60)

@@ -1,243 +1,226 @@
 """
-MedGemma fine-tuning script for medical imaging tasks
+MedGemma fine-tuning script using official Google approach:
+- AutoModelForImageTextToText (not AutoModelForCausalLM)
+- SFTTrainer from HuggingFace TRL
+- Conversational format (image + text prompt → answer)
+- QLoRA (4-bit quantization + LoRA adapters)
+
+Based on: https://github.com/google-health/medgemma/blob/main/notebooks/fine_tune_with_hugging_face.ipynb
 """
 
 import os
 import yaml
 import argparse
+import json
 from pathlib import Path
+from typing import Any, Dict, List
 import torch
-import torch.nn as nn
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import (
-    AutoModelForCausalLM,
-    AutoTokenizer,
-    AutoImageProcessor,
+    AutoProcessor,
+    AutoModelForImageTextToText,
     BitsAndBytesConfig,
 )
-from peft import (
-    LoraConfig,
-    get_peft_model,
-    prepare_model_for_kbit_training,
-    TaskType,
-)
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-# import wandb
-from typing import Dict, List, Tuple
+from peft import LoraConfig
+from trl import SFTConfig, SFTTrainer
+from datasets import Dataset, DatasetDict
+from PIL import Image
+import numpy as np
 
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
 
 from src.utils.data_loader import (
-    create_dataloaders,
     prepare_rsna_hemorrhage_data,
     prepare_siim_pneumothorax_data,
 )
 from src.utils.metrics import (
     compute_classification_metrics,
     plot_confusion_matrix,
-    plot_roc_curves,
 )
 
 
-class MedGemmaClassifier(nn.Module):
-    """MedGemma-based image classifier"""
+def prepare_conversational_dataset(
+    image_paths: List[str],
+    labels: List[int],
+    class_labels: List[str],
+    prompt: str,
+    train_split: float = 0.9,
+) -> DatasetDict:
+    """Convert image classification data to MedGemma conversational format.
     
-    def __init__(
-        self,
-        model_name: str,
-        num_classes: int,
-        load_in_4bit: bool = True,
-        device_map: str = "auto",
-    ):
-        super().__init__()
+    Args:
+        image_paths: List of paths to images
+        labels: List of integer labels
+        class_labels: List of class names (e.g., ["A: No hemorrhage", "B: Epidural", ...])
+        prompt: Task prompt to use
+        train_split: Fraction for training set
+    
+    Returns:
+        DatasetDict with 'train' and 'validation' splits
+    """
+    def load_and_format(img_path: str, label: int) -> Dict[str, Any]:
+        """Load image and format as conversation."""
+        try:
+            # Load image
+            if img_path.endswith('.dcm'):
+                import pydicom
+                dcm = pydicom.dcmread(img_path)
+                arr = dcm.pixel_array.astype(np.float32)
+                arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8) * 255
+                image = Image.fromarray(arr.astype(np.uint8)).convert('RGB')
+            else:
+                image = Image.open(img_path).convert('RGB')
+            
+            # Format as conversation
+            return {
+                'image': image,
+                'label': label,
+                'messages': [
+                    {
+                        'role': 'user',
+                        'content': [
+                            {'type': 'image'},
+                            {'type': 'text', 'text': prompt},
+                        ],
+                    },
+                    {
+                        'role': 'assistant',
+                        'content': [
+                            {'type': 'text', 'text': class_labels[label]},
+                        ],
+                    },
+                ],
+            }
+        except Exception as e:
+            print(f"Error loading {img_path}: {e}")
+            return None
+    
+    # Load and format all examples
+    examples = []
+    for img_path, label in zip(image_paths, labels):
+        result = load_and_format(img_path, label)
+        if result is not None:
+            examples.append(result)
+    
+    # Split into train/val
+    split_idx = int(len(examples) * train_split)
+    train_data = examples[:split_idx]
+    val_data = examples[split_idx:]
+    
+    return DatasetDict({
+        'train': Dataset.from_list(train_data),
+        'validation': Dataset.from_list(val_data),
+    })
+
+
+def create_data_collator(processor: AutoProcessor) -> callable:
+    """Create custom data collator for multimodal inputs.
+    
+    Args:
+        processor: MedGemma processor
+    
+    Returns:
+        Collator function
+    """
+    def collate_fn(examples: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        """Process examples with text + images."""
+        texts = []
+        images = []
         
-        # Configure quantization
-        if load_in_4bit:
-            bnb_config = BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
+        for example in examples:
+            images.append([example['image'].convert('RGB')])
+            texts.append(
+                processor.apply_chat_template(
+                    example['messages'],
+                    add_generation_prompt=False,
+                    tokenize=False,
+                ).strip()
             )
-        else:
-            bnb_config = None
         
-        # Load base model
-        self.base_model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map=device_map,
-            trust_remote_code=True,
+        # Tokenize and process
+        batch = processor(text=texts, images=images, return_tensors='pt', padding=True)
+        
+        # Create labels: mask padding and image tokens
+        labels = batch['input_ids'].clone()
+        
+        # Mask image tokens
+        image_token_id = processor.tokenizer.convert_tokens_to_ids(
+            processor.tokenizer.special_tokens_map.get('boi_token', '<image>')
         )
+        labels[labels == processor.tokenizer.pad_token_id] = -100
+        if isinstance(image_token_id, int):
+            labels[labels == image_token_id] = -100
+        labels[labels == 262144] = -100  # Additional image placeholder
         
-        # Get hidden size
-        hidden_size = self.base_model.config.hidden_size
-        
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_size // 2, num_classes),
+        batch['labels'] = labels
+        return batch
+    
+    return collate_fn
+
+
+def load_medgemma_model(
+    model_id: str,
+    load_in_4bit: bool = True,
+) -> tuple:
+    """Load MedGemma model with QLoRA.
+    
+    Args:
+        model_id: HuggingFace model ID (e.g., 'google/medgemma-4b-it')
+        load_in_4bit: Whether to use 4-bit quantization
+    
+    Returns:
+        (model, processor)
+    """
+    # Determine dtype based on GPU capability
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        compute_dtype = torch.bfloat16
+        print("Using bfloat16 (A100/H100 detected)")
+    else:
+        compute_dtype = torch.float16
+        print("Using float16 (T4/V100 detected)")
+    
+    # QLoRA config
+    bnb_config = None
+    if load_in_4bit:
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type='nf4',
+            bnb_4bit_compute_dtype=compute_dtype,
+            bnb_4bit_quant_storage=compute_dtype,
         )
-        
-        self.num_classes = num_classes
-        
-    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            pixel_values: Image tensor [batch, 3, height, width]
-        
-        Returns:
-            Logits [batch, num_classes]
-        """
-        # Get image embeddings from base model
-        outputs = self.base_model(
-            pixel_values=pixel_values,
-            output_hidden_states=True,
-        )
-        
-        # Use last hidden state and pool
-        hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_size]
-        pooled = hidden_states.mean(dim=1)  # [batch, hidden_size]
-        
-        # Classify
-        logits = self.classifier(pooled)  # [batch, num_classes]
-        
-        return logits
-
-
-def train_epoch(
-    model: nn.Module,
-    train_loader: torch.utils.data.DataLoader,
-    criterion: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    device: torch.device,
-    epoch: int,
-) -> Dict[str, float]:
-    """Train for one epoch"""
     
-    model.train()
-    total_loss = 0
-    correct = 0
-    total = 0
-    
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
-    for batch_idx, batch in enumerate(pbar):
-        images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        
-        # Forward pass
-        optimizer.zero_grad()
-        logits = model(images)
-        loss = criterion(logits, labels)
-        
-        # Backward pass
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        # Metrics
-        total_loss += loss.item()
-        _, predicted = logits.max(1)
-        total += labels.size(0)
-        
-        if len(labels.shape) == 1:
-            # Single-label classification
-            correct += predicted.eq(labels).sum().item()
-        else:
-            # Multi-label classification
-            predicted_labels = (torch.sigmoid(logits) > 0.5).float()
-            correct += (predicted_labels == labels).all(dim=1).sum().item()
-        
-        # Update progress bar
-        pbar.set_postfix({
-            'loss': total_loss / (batch_idx + 1),
-            'acc': 100. * correct / total,
-        })
-    
-    return {
-        'train_loss': total_loss / len(train_loader),
-        'train_acc': 100. * correct / total,
-    }
-
-
-@torch.no_grad()
-def evaluate(
-    model: nn.Module,
-    val_loader: torch.utils.data.DataLoader,
-    criterion: nn.Module,
-    device: torch.device,
-    epoch: int,
-) -> Dict[str, float]:
-    """Evaluate model"""
-    
-    model.eval()
-    total_loss = 0
-    all_predictions = []
-    all_labels = []
-    all_probabilities = []
-    
-    pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Val]")
-    for batch in pbar:
-        images = batch['image'].to(device)
-        labels = batch['label'].to(device)
-        
-        # Forward pass
-        logits = model(images)
-        loss = criterion(logits, labels)
-        
-        total_loss += loss.item()
-        
-        # Get predictions
-        probabilities = torch.softmax(logits, dim=1)
-        _, predicted = logits.max(1)
-        
-        all_predictions.extend(predicted.cpu().numpy())
-        all_labels.extend(labels.cpu().numpy())
-        all_probabilities.extend(probabilities.cpu().numpy())
-    
-    # Compute metrics
-    metrics = compute_classification_metrics(
-        y_true=all_labels,
-        y_pred=all_predictions,
-        y_prob=all_probabilities,
+    # Load model
+    model = AutoModelForImageTextToText.from_pretrained(
+        model_id,
+        quantization_config=bnb_config,
+        attn_implementation='eager',
+        torch_dtype=compute_dtype,
+        device_map='auto',
     )
     
-    metrics['val_loss'] = total_loss / len(val_loader)
+    processor = AutoProcessor.from_pretrained(model_id)
+    processor.tokenizer.padding_side = 'right'
     
-    return metrics
+    return model, processor
 
 
 def main(config_path: str):
-    """Main training function"""
+    """Main training function using SFTTrainer."""
     
     # Load config
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
     
-    # Setup
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    print(f"Config loaded from: {config_path}")
+    print(f"Task: {config['task']['name']}")
     
     # Create output directory
     output_dir = Path(config['training']['output_dir'])
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Initialize wandb
-    if config.get('wandb', {}).get('enabled', False):
-        wandb.init(
-            project=config['wandb']['project'],
-            entity=config['wandb'].get('entity'),
-            name=config['wandb']['name'],
-            config=config,
-        )
-    
     # Prepare data
-    print("Preparing dataset...")
+    print("\nPreparing dataset...")
     dataset_name = config['data']['dataset_name']
     
     if dataset_name == 'rsna_hemorrhage':
@@ -247,159 +230,130 @@ def main(config_path: str):
     else:
         raise ValueError(f"Unknown dataset: {dataset_name}")
     
-    # Split data
-    train_val_df, test_df = train_test_split(
-        df,
-        test_size=config['data']['test_split'],
-        random_state=42,
-        stratify=df['label'] if 'label' in df.columns else None,
+    # Extract image paths and labels
+    image_paths = df['image_path'].tolist()
+    labels = df['label'].tolist()
+    
+    # Get class labels and prompt from config
+    class_labels = config['task']['class_labels']
+    prompt = config['task']['prompt']
+    
+    print(f"Total samples: {len(image_paths)}")
+    print(f"Classes: {len(class_labels)}")
+    
+    # Convert to conversational format
+    data = prepare_conversational_dataset(
+        image_paths=image_paths,
+        labels=labels,
+        class_labels=class_labels,
+        prompt=prompt,
+        train_split=config['data'].get('train_split', 0.9),
     )
     
-    train_df, val_df = train_test_split(
-        train_val_df,
-        test_size=config['data']['val_split'] / (1 - config['data']['test_split']),
-        random_state=42,
-        stratify=train_val_df['label'] if 'label' in train_val_df.columns else None,
+    print(f"Train: {len(data['train'])}, Val: {len(data['validation'])}")
+    
+    # Load model
+    print("\nLoading MedGemma model...")
+    model, processor = load_medgemma_model(
+        model_id=config['model']['name'],
+        load_in_4bit=config['model'].get('load_in_4bit', True),
     )
     
-    print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
-    
-    # Create dataloaders
-    train_loader, val_loader, test_loader = create_dataloaders(
-        config=config,
-        train_df=train_df,
-        val_df=val_df,
-        test_df=test_df,
-    )
-    
-    # Initialize model
-    print("Initializing model...")
-    num_classes = len(config['task']['classes'])
-    
-    model = MedGemmaClassifier(
-        model_name=config['model']['name'],
-        num_classes=num_classes,
-        load_in_4bit=config['model']['load_in_4bit'],
-        device_map=config['model']['device_map'],
-    )
-    
-    # Prepare for k-bit training
-    model.base_model = prepare_model_for_kbit_training(model.base_model)
-    
-    # Apply LoRA
-    lora_config = LoraConfig(
-        r=config['lora']['r'],
+    # LoRA config
+    peft_config = LoraConfig(
         lora_alpha=config['lora']['lora_alpha'],
-        target_modules=config['lora']['target_modules'],
         lora_dropout=config['lora']['lora_dropout'],
+        r=config['lora']['r'],
         bias=config['lora']['bias'],
-        task_type=config['lora']['task_type'],
+        target_modules=config['lora']['target_modules'],
+        task_type='CAUSAL_LM',
+        modules_to_save=['lm_head', 'embed_tokens'],
     )
     
-    model.base_model = get_peft_model(model.base_model, lora_config)
-    model.base_model.print_trainable_parameters()
+    # Training config
+    training_config = config['training']
     
-    # Move to device
-    model = model.to(device)
-    
-    # Loss function
-    if config['task']['type'] == 'binary_classification':
-        criterion = nn.BCEWithLogitsLoss()
+    # Adjust batch size based on GPU
+    if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8:
+        batch_size = training_config.get('batch_size', 4)
+        grad_accum = training_config.get('gradient_accumulation_steps', 4)
     else:
-        criterion = nn.CrossEntropyLoss()
+        batch_size = 1
+        grad_accum = training_config.get('gradient_accumulation_steps', 16)
     
-    # Optimizer
-    optimizer = AdamW(
-        model.parameters(),
-        lr=config['training']['learning_rate'],
-        weight_decay=config['training']['weight_decay'],
+    # Determine dtype
+    compute_dtype = torch.bfloat16 if (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8) else torch.float16
+    
+    training_args = SFTConfig(
+        output_dir=str(output_dir),
+        num_train_epochs=training_config['epochs'],
+        per_device_train_batch_size=batch_size,
+        per_device_eval_batch_size=batch_size,
+        gradient_accumulation_steps=grad_accum,
+        gradient_checkpointing=True,
+        optim='adamw_torch_fused',
+        logging_steps=training_config.get('logging_steps', 10),
+        save_strategy='epoch',
+        eval_strategy='steps',
+        eval_steps=training_config.get('eval_steps', 50),
+        learning_rate=training_config['learning_rate'],
+        bf16=(compute_dtype == torch.bfloat16),
+        fp16=(compute_dtype == torch.float16),
+        max_grad_norm=0.3,
+        warmup_ratio=0.03,
+        lr_scheduler_type='linear',
+        push_to_hub=False,
+        report_to='tensorboard',
+        gradient_checkpointing_kwargs={'use_reentrant': False},
+        dataset_kwargs={'skip_prepare_dataset': True},
+        remove_unused_columns=False,
+        label_names=['labels'],
     )
     
-    # Scheduler
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=config['training']['num_train_epochs'],
-    )
-    
-    # Training loop
-    print("Starting training...")
-    best_val_acc = 0
-    
-    for epoch in range(1, config['training']['num_train_epochs'] + 1):
-        # Train
-        train_metrics = train_epoch(
-            model=model,
-            train_loader=train_loader,
-            criterion=criterion,
-            optimizer=optimizer,
-            device=device,
-            epoch=epoch,
-        )
-        
-        # Evaluate
-        val_metrics = evaluate(
-            model=model,
-            val_loader=val_loader,
-            criterion=criterion,
-            device=device,
-            epoch=epoch,
-        )
-        
-        # Log metrics
-        print(f"\nEpoch {epoch}:")
-        print(f"  Train Loss: {train_metrics['train_loss']:.4f}, Acc: {train_metrics['train_acc']:.2f}%")
-        print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
-        print(f"  Val Accuracy: {val_metrics['accuracy']:.2f}%")
-        print(f"  Val Sensitivity: {val_metrics['sensitivity']:.2f}%")
-        print(f"  Val Specificity: {val_metrics['specificity']:.2f}%")
-        print(f"  Val AUC-ROC: {val_metrics['auc_roc']:.4f}")
-        
-        if config.get('wandb', {}).get('enabled', False):
-            wandb.log({**train_metrics, **val_metrics, 'epoch': epoch})
-        
-        # Save best model
-        if val_metrics['accuracy'] > best_val_acc:
-            best_val_acc = val_metrics['accuracy']
-            save_path = output_dir / 'best_model.pt'
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_metrics': val_metrics,
-                'config': config,
-            }, save_path)
-            print(f"  Saved best model to {save_path}")
-        
-        # Update scheduler
-        scheduler.step()
-    
-    # Final evaluation on test set
-    print("\nEvaluating on test set...")
-    test_metrics = evaluate(
+    # Create trainer
+    print("\nInitializing SFTTrainer...")
+    trainer = SFTTrainer(
         model=model,
-        val_loader=test_loader,
-        criterion=criterion,
-        device=device,
-        epoch=0,
+        args=training_args,
+        train_dataset=data['train'],
+        eval_dataset=data['validation'],
+        peft_config=peft_config,
+        processing_class=processor,
+        data_collator=create_data_collator(processor),
     )
     
-    print(f"\nTest Results:")
-    print(f"  Accuracy: {test_metrics['accuracy']:.2f}%")
-    print(f"  Sensitivity: {test_metrics['sensitivity']:.2f}%")
-    print(f"  Specificity: {test_metrics['specificity']:.2f}%")
-    print(f"  AUC-ROC: {test_metrics['auc_roc']:.4f}")
+    print(f"Effective batch size: {batch_size * grad_accum}")
+    print(f"Training steps: ~{len(data['train']) // (batch_size * grad_accum)}")
     
-    # Save final model
-    final_save_path = output_dir / 'final_model.pt'
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'test_metrics': test_metrics,
-        'config': config,
-    }, final_save_path)
-    print(f"\nSaved final model to {final_save_path}")
+    # Train
+    print("\n🚀 Starting training...")
+    trainer.train()
     
-    if config.get('wandb', {}).get('enabled', False):
-        wandb.finish()
+    # Save model
+    print("\nSaving model...")
+    trainer.save_model(output_dir)
+    processor.save_pretrained(output_dir)
+    
+    # Save metrics
+    metrics = trainer.state.log_history
+    with open(output_dir / 'training_metrics.json', 'w') as f:
+        json.dump(metrics, f, indent=2)
+    
+    # Save task config
+    task_config = {
+        'model_id': config['model']['name'],
+        'task': config['task']['name'],
+        'class_labels': class_labels,
+        'prompt': prompt,
+        'lora_dir': str(output_dir),
+    }
+    with open(output_dir / 'task_config.json', 'w') as f:
+        json.dump(task_config, f, indent=2)
+    
+    print(f"\n✓ Training complete!")
+    print(f"  Model saved to: {output_dir}")
+    print(f"  Metrics: {output_dir}/training_metrics.json")
+    print(f"  Config: {output_dir}/task_config.json")
 
 
 if __name__ == '__main__':
