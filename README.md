@@ -2,6 +2,8 @@
 
 **AI-powered critical decision support for rural emergency departments when specialists aren't available**
 
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ApoorvThite/rural-emergency-triage-ai/blob/master/notebooks/Colab_Training_Complete.ipynb)
+
 Built for the [MedGemma Impact Challenge](https://www.kaggle.com/competitions/medgemma-impact-challenge) on Kaggle.
 
 ---

@@ -36,8 +36,8 @@ Before you start, you need:
 ### Open the Notebook
 
 1. Go to the notebook:
-   - **GitHub**: [Colab_Training_Complete.ipynb](../notebooks/Colab_Training_Complete.ipynb)
-   - **Direct Colab**: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/YOUR_USERNAME/rural-emergency-triage-ai/blob/main/notebooks/Colab_Training_Complete.ipynb)
+   - **GitHub**: [Colab_Training_Complete.ipynb](https://github.com/ApoorvThite/rural-emergency-triage-ai/blob/master/notebooks/Colab_Training_Complete.ipynb)
+   - **Direct Colab**: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/ApoorvThite/rural-emergency-triage-ai/blob/master/notebooks/Colab_Training_Complete.ipynb)
 
 2. **Select GPU Runtime**:
    - Click **Runtime** → **Change runtime type**
