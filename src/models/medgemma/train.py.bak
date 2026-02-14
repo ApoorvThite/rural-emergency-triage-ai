@@ -24,7 +24,7 @@ from peft import (
 )
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-# import wandb
+import wandb
 from typing import Dict, List, Tuple
 
 import sys
