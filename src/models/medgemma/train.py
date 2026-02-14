@@ -1,0 +1,415 @@
+"""
+MedGemma fine-tuning script for medical imaging tasks
+"""
+
+import os
+import yaml
+import argparse
+from pathlib import Path
+import torch
+import torch.nn as nn
+from torch.optim import AdamW
+from torch.optim.lr_scheduler import CosineAnnealingLR
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    AutoImageProcessor,
+    BitsAndBytesConfig,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    prepare_model_for_kbit_training,
+    TaskType,
+)
+from sklearn.model_selection import train_test_split
+from tqdm import tqdm
+import wandb
+from typing import Dict, List, Tuple
+
+import sys
+sys.path.append(os.path.join(os.path.dirname(__file__), '../../..'))
+
+from src.utils.data_loader import (
+    create_dataloaders,
+    prepare_rsna_hemorrhage_data,
+    prepare_siim_pneumothorax_data,
+)
+from src.utils.metrics import (
+    compute_classification_metrics,
+    plot_confusion_matrix,
+    plot_roc_curves,
+)
+
+
+class MedGemmaClassifier(nn.Module):
+    """MedGemma-based image classifier"""
+    
+    def __init__(
+        self,
+        model_name: str,
+        num_classes: int,
+        load_in_4bit: bool = True,
+        device_map: str = "auto",
+    ):
+        super().__init__()
+        
+        # Configure quantization
+        if load_in_4bit:
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+            )
+        else:
+            bnb_config = None
+        
+        # Load base model
+        self.base_model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            quantization_config=bnb_config,
+            device_map=device_map,
+            trust_remote_code=True,
+        )
+        
+        # Get hidden size
+        hidden_size = self.base_model.config.hidden_size
+        
+        # Classification head
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_size // 2, num_classes),
+        )
+        
+        self.num_classes = num_classes
+        
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            pixel_values: Image tensor [batch, 3, height, width]
+        
+        Returns:
+            Logits [batch, num_classes]
+        """
+        # Get image embeddings from base model
+        outputs = self.base_model(
+            pixel_values=pixel_values,
+            output_hidden_states=True,
+        )
+        
+        # Use last hidden state and pool
+        hidden_states = outputs.hidden_states[-1]  # [batch, seq_len, hidden_size]
+        pooled = hidden_states.mean(dim=1)  # [batch, hidden_size]
+        
+        # Classify
+        logits = self.classifier(pooled)  # [batch, num_classes]
+        
+        return logits
+
+
+def train_epoch(
+    model: nn.Module,
+    train_loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    device: torch.device,
+    epoch: int,
+) -> Dict[str, float]:
+    """Train for one epoch"""
+    
+    model.train()
+    total_loss = 0
+    correct = 0
+    total = 0
+    
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch} [Train]")
+    for batch_idx, batch in enumerate(pbar):
+        images = batch['image'].to(device)
+        labels = batch['label'].to(device)
+        
+        # Forward pass
+        optimizer.zero_grad()
+        logits = model(images)
+        loss = criterion(logits, labels)
+        
+        # Backward pass
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        
+        # Metrics
+        total_loss += loss.item()
+        _, predicted = logits.max(1)
+        total += labels.size(0)
+        
+        if len(labels.shape) == 1:
+            # Single-label classification
+            correct += predicted.eq(labels).sum().item()
+        else:
+            # Multi-label classification
+            predicted_labels = (torch.sigmoid(logits) > 0.5).float()
+            correct += (predicted_labels == labels).all(dim=1).sum().item()
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': total_loss / (batch_idx + 1),
+            'acc': 100. * correct / total,
+        })
+    
+    return {
+        'train_loss': total_loss / len(train_loader),
+        'train_acc': 100. * correct / total,
+    }
+
+
+@torch.no_grad()
+def evaluate(
+    model: nn.Module,
+    val_loader: torch.utils.data.DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    epoch: int,
+) -> Dict[str, float]:
+    """Evaluate model"""
+    
+    model.eval()
+    total_loss = 0
+    all_predictions = []
+    all_labels = []
+    all_probabilities = []
+    
+    pbar = tqdm(val_loader, desc=f"Epoch {epoch} [Val]")
+    for batch in pbar:
+        images = batch['image'].to(device)
+        labels = batch['label'].to(device)
+        
+        # Forward pass
+        logits = model(images)
+        loss = criterion(logits, labels)
+        
+        total_loss += loss.item()
+        
+        # Get predictions
+        probabilities = torch.softmax(logits, dim=1)
+        _, predicted = logits.max(1)
+        
+        all_predictions.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+        all_probabilities.extend(probabilities.cpu().numpy())
+    
+    # Compute metrics
+    metrics = compute_classification_metrics(
+        y_true=all_labels,
+        y_pred=all_predictions,
+        y_prob=all_probabilities,
+    )
+    
+    metrics['val_loss'] = total_loss / len(val_loader)
+    
+    return metrics
+
+
+def main(config_path: str):
+    """Main training function"""
+    
+    # Load config
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+    
+    # Setup
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
+    # Create output directory
+    output_dir = Path(config['training']['output_dir'])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Initialize wandb
+    if config.get('wandb', {}).get('enabled', False):
+        wandb.init(
+            project=config['wandb']['project'],
+            entity=config['wandb'].get('entity'),
+            name=config['wandb']['name'],
+            config=config,
+        )
+    
+    # Prepare data
+    print("Preparing dataset...")
+    dataset_name = config['data']['dataset_name']
+    
+    if dataset_name == 'rsna_hemorrhage':
+        df = prepare_rsna_hemorrhage_data(config['data']['data_dir'])
+    elif dataset_name == 'siim_pneumothorax':
+        df = prepare_siim_pneumothorax_data(config['data']['data_dir'])
+    else:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+    
+    # Split data
+    train_val_df, test_df = train_test_split(
+        df,
+        test_size=config['data']['test_split'],
+        random_state=42,
+        stratify=df['label'] if 'label' in df.columns else None,
+    )
+    
+    train_df, val_df = train_test_split(
+        train_val_df,
+        test_size=config['data']['val_split'] / (1 - config['data']['test_split']),
+        random_state=42,
+        stratify=train_val_df['label'] if 'label' in train_val_df.columns else None,
+    )
+    
+    print(f"Train: {len(train_df)}, Val: {len(val_df)}, Test: {len(test_df)}")
+    
+    # Create dataloaders
+    train_loader, val_loader, test_loader = create_dataloaders(
+        config=config,
+        train_df=train_df,
+        val_df=val_df,
+        test_df=test_df,
+    )
+    
+    # Initialize model
+    print("Initializing model...")
+    num_classes = len(config['task']['classes'])
+    
+    model = MedGemmaClassifier(
+        model_name=config['model']['name'],
+        num_classes=num_classes,
+        load_in_4bit=config['model']['load_in_4bit'],
+        device_map=config['model']['device_map'],
+    )
+    
+    # Prepare for k-bit training
+    model.base_model = prepare_model_for_kbit_training(model.base_model)
+    
+    # Apply LoRA
+    lora_config = LoraConfig(
+        r=config['lora']['r'],
+        lora_alpha=config['lora']['lora_alpha'],
+        target_modules=config['lora']['target_modules'],
+        lora_dropout=config['lora']['lora_dropout'],
+        bias=config['lora']['bias'],
+        task_type=config['lora']['task_type'],
+    )
+    
+    model.base_model = get_peft_model(model.base_model, lora_config)
+    model.base_model.print_trainable_parameters()
+    
+    # Move to device
+    model = model.to(device)
+    
+    # Loss function
+    if config['task']['type'] == 'binary_classification':
+        criterion = nn.BCEWithLogitsLoss()
+    else:
+        criterion = nn.CrossEntropyLoss()
+    
+    # Optimizer
+    optimizer = AdamW(
+        model.parameters(),
+        lr=config['training']['learning_rate'],
+        weight_decay=config['training']['weight_decay'],
+    )
+    
+    # Scheduler
+    scheduler = CosineAnnealingLR(
+        optimizer,
+        T_max=config['training']['num_train_epochs'],
+    )
+    
+    # Training loop
+    print("Starting training...")
+    best_val_acc = 0
+    
+    for epoch in range(1, config['training']['num_train_epochs'] + 1):
+        # Train
+        train_metrics = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            criterion=criterion,
+            optimizer=optimizer,
+            device=device,
+            epoch=epoch,
+        )
+        
+        # Evaluate
+        val_metrics = evaluate(
+            model=model,
+            val_loader=val_loader,
+            criterion=criterion,
+            device=device,
+            epoch=epoch,
+        )
+        
+        # Log metrics
+        print(f"\nEpoch {epoch}:")
+        print(f"  Train Loss: {train_metrics['train_loss']:.4f}, Acc: {train_metrics['train_acc']:.2f}%")
+        print(f"  Val Loss: {val_metrics['val_loss']:.4f}")
+        print(f"  Val Accuracy: {val_metrics['accuracy']:.2f}%")
+        print(f"  Val Sensitivity: {val_metrics['sensitivity']:.2f}%")
+        print(f"  Val Specificity: {val_metrics['specificity']:.2f}%")
+        print(f"  Val AUC-ROC: {val_metrics['auc_roc']:.4f}")
+        
+        if config.get('wandb', {}).get('enabled', False):
+            wandb.log({**train_metrics, **val_metrics, 'epoch': epoch})
+        
+        # Save best model
+        if val_metrics['accuracy'] > best_val_acc:
+            best_val_acc = val_metrics['accuracy']
+            save_path = output_dir / 'best_model.pt'
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'val_metrics': val_metrics,
+                'config': config,
+            }, save_path)
+            print(f"  Saved best model to {save_path}")
+        
+        # Update scheduler
+        scheduler.step()
+    
+    # Final evaluation on test set
+    print("\nEvaluating on test set...")
+    test_metrics = evaluate(
+        model=model,
+        val_loader=test_loader,
+        criterion=criterion,
+        device=device,
+        epoch=0,
+    )
+    
+    print(f"\nTest Results:")
+    print(f"  Accuracy: {test_metrics['accuracy']:.2f}%")
+    print(f"  Sensitivity: {test_metrics['sensitivity']:.2f}%")
+    print(f"  Specificity: {test_metrics['specificity']:.2f}%")
+    print(f"  AUC-ROC: {test_metrics['auc_roc']:.4f}")
+    
+    # Save final model
+    final_save_path = output_dir / 'final_model.pt'
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'test_metrics': test_metrics,
+        'config': config,
+    }, final_save_path)
+    print(f"\nSaved final model to {final_save_path}")
+    
+    if config.get('wandb', {}).get('enabled', False):
+        wandb.finish()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        '--config',
+        type=str,
+        required=True,
+        help='Path to config YAML file',
+    )
+    args = parser.parse_args()
+    
+    main(args.config)
