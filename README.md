@@ -66,17 +66,39 @@ rural-emergency-triage-ai/
 
 ---
 
-## 🚀 Quick Start
+## ⚡ Quick Start
 
-### Prerequisites
+**🎯 Want to train a model right now?** → **[Click here for Colab](https://colab.research.google.com/github/ApoorvThite/rural-emergency-triage-ai/blob/master/notebooks/Colab_Training_Complete.ipynb)** (No setup required!)
+
+### Option 1: Train in Google Colab (Recommended)
+
+**Best for**: Getting started quickly, free GPU access, no local setup
+
+1. Click the Colab badge above
+2. Add your HuggingFace token to Colab Secrets
+3. Run all cells
+4. Download trained model from Google Drive
+
+**Time**: 30 min (quick test) to 18 hours (full training)  
+**Cost**: Free (T4 GPU) or $10/month (A100 via Colab Pro)
+
+📖 **Full guide**: [docs/COLAB_QUICKSTART.md](docs/COLAB_QUICKSTART.md)
+
+---
+
+### Option 2: Local Setup
+
+**Best for**: Development, custom datasets, offline training
+
+#### Prerequisites
 - Python 3.10+
 - CUDA-capable GPU (recommended: 16GB+ VRAM)
 - 50GB+ disk space for datasets
 
-### Installation
+#### Installation
 ```bash
 # Clone repository
-git clone https://github.com/YOUR_USERNAME/rural-emergency-triage-ai.git
+git clone https://github.com/ApoorvThite/rural-emergency-triage-ai.git
 cd rural-emergency-triage-ai
 
 # Create virtual environment
@@ -152,8 +174,17 @@ npm start
 
 ## 📖 Documentation
 
+### Training & Inference
+- **[Quick Start Guide](QUICK_START.md)** - Get started in 3 steps ⭐
+- **[Colab Training Guide](docs/COLAB_QUICKSTART.md)** - Complete Colab walkthrough
+- **[Scaling Training](docs/SCALING_TRAINING.md)** - From 500 to 100K samples
+- **[Local Inference](docs/LOCAL_INFERENCE.md)** - Use trained models locally
+- [Training Guide](docs/TRAINING_GUIDE.md) - Local training setup
+
+### Technical Details
 - [Architecture Overview](docs/ARCHITECTURE.md)
 - [Dataset Details](docs/DATASET.md)
+- [Dataset Download](docs/DATASET_DOWNLOAD.md)
 - [Deployment Guide](docs/DEPLOYMENT.md)
 - [Model Evaluation](docs/EVALUATION.md)
 - [Impact Analysis](docs/IMPACT_ANALYSIS.md)
